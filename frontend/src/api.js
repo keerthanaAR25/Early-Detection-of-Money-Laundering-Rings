@@ -31,4 +31,5 @@ export const api = {
   pipelineStats: () => get("/pipeline-stats"),
   evaluationContext: () => get("/evaluation-context"),
   ringEarlyWarning: () => get("/ring-early-warning"),
+  evaluation: () => get("/evaluation"),
 };

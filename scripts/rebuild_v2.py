@@ -198,6 +198,9 @@ def stage_export(a, s):
     dump("pattern_events.json", art["pattern_events"])
     dump("trajectories.json", art["trajectories"])
     dump("model_comparison.json", {k: {"val": v["val"], "test": v["test"], "threshold_selection": v["threshold_selection"]} for k, v in mdl.items()})
+    curves = {k: v["curves"] for k, v in mdl.items() if v.get("curves")}
+    if curves:                       # ROC and precision-recall curves for the Evaluation page; written only when the models stage produced them
+        dump("evaluation_curves.json", {"horizon_days": s.horizon, "split": "test", "threshold_rule": "max F1 on validation", "models": curves})
     stab_path = WORK / "stability.json"
     stability = None
     if stab_path.exists():

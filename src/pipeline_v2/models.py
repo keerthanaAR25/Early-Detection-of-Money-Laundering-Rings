@@ -34,6 +34,47 @@ def metrics_at(y, s, thr):
             "top_k_precision": {str(k): float(y[top[:k]].sum() / k) for k in (10, 20, 50)}}
 
 
+CURVE_POINTS = 300                      # a curve is thinned to about this many points so the result file stays small
+K_GRID = (5, 10, 20, 30, 50, 75, 100, 150, 200)
+
+
+def curve_data(y, s):
+    """ROC curve, precision-recall curve and precision at K for one model's test scores, for the Evaluation page.
+
+    Computed from the SAME scores as metrics_at(), and checked against it: the average precision of the stored precision-recall
+    points equals metrics_at's PR-AUC, and precision at K uses the same ordering. Nothing here is estimated or smoothed.
+    The ROC curve is thinned (equal steps along its length); the precision-recall curve keeps every point where a positive is
+    found, so it is exact. A mismatch raises, so a curve can never disagree with the reported metric."""
+    from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score, roc_curve
+    y = np.asarray(y).astype(int)
+    s = np.asarray(s, dtype=float)
+    P, N = int(y.sum()), int(len(y) - y.sum())
+    if P == 0 or N == 0:
+        return None
+    fpr, tpr, _ = roc_curve(y, s, drop_intermediate=True)
+    seg = np.r_[0.0, np.cumsum(np.hypot(np.diff(fpr), np.diff(tpr)))]
+    if len(fpr) > CURVE_POINTS:
+        pick = np.unique(np.r_[0, np.searchsorted(seg, np.linspace(0, seg[-1], CURVE_POINTS)), len(fpr) - 1])
+        pick = pick[pick < len(fpr)]
+        fpr, tpr = fpr[pick], tpr[pick]
+    prec, rec, _ = precision_recall_curve(y, s)
+    prec, rec = prec[::-1], rec[::-1]                                  # ascending recall; starts at recall 0, precision 1
+    keep = np.r_[True, np.diff(rec) > 0]                               # one point per positive found
+    prec_k, rec_k = prec[keep], rec[keep]
+    ap_points = float(np.sum(np.diff(rec_k) * prec_k[1:]))
+    ap = float(average_precision_score(y, s))
+    if abs(ap_points - ap) > 1e-9:
+        raise AssertionError(f"precision-recall points give {ap_points} but average precision is {ap}")
+    sr = np.round(s, NOISE_DECIMALS)
+    top = np.argsort(-sr, kind="stable")
+    cum = np.cumsum(y[top])
+    return {"n": int(len(y)), "n_positive": P, "prevalence": P / len(y),
+            "roc_auc": float(roc_auc_score(y, s)), "pr_auc": ap,
+            "roc": [[round(float(a), 8), round(float(b), 6)] for a, b in zip(fpr, tpr)],
+            "pr": [[round(float(a), 6), round(float(b), 6)] for a, b in zip(rec_k, prec_k)],
+            "precision_at_k": [[int(k), float(cum[k - 1] / k)] for k in K_GRID if k <= len(y)]}
+
+
 def _subsample(X, y, n_neg, seed):
     rng = np.random.default_rng(seed)
     pos = np.flatnonzero(y == 1)
@@ -72,7 +113,11 @@ def evaluate_family(state, Y, name, s):
     tr, va, te = (AW.make_rows(state, Y, cols, *b[k]) for k in ("train", "val", "test"))
     sv, st = fit_scores(kind, tr[0], tr[1], [va[0], te[0]], s.seed, 300)
     thr = AW.choose_threshold(va[1], sv)                               # validation only
-    return {"val": metrics_at(va[1], sv, thr), "test": metrics_at(te[1], st, thr),
+    test_metrics = metrics_at(te[1], st, thr)
+    curves = curve_data(te[1], st)
+    if curves and abs(curves["roc_auc"] - test_metrics["roc_auc"]) > 1e-12:      # same scores, same metric: they must agree exactly
+        raise AssertionError("ROC-AUC of the curve differs from the reported ROC-AUC")
+    return {"val": metrics_at(va[1], sv, thr), "test": test_metrics, "curves": curves,
             "threshold_selection": {"rule": "max F1 on validation", "value": float(thr)},
             "protocol": {"model_family": kind, "features": cols, "horizon_days": s.horizon, "train_days": list(b["train"]),
                          "validation_days": list(b["val"]), "test_days": list(b["test"])}}

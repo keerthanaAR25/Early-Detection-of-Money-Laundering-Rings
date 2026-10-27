@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import fx from "./fixtures/api.json";
 import Overview from "../src/pages/Overview.jsx";
 import AlertQueue from "../src/pages/AlertQueue.jsx";
@@ -14,7 +14,7 @@ import AlertLog from "../src/pages/AlertLog.jsx";
 import PatternEvidence from "../src/pages/PatternEvidence.jsx";
 import { fireEvent } from "@testing-library/react";
 import { dateOf } from "../src/components/warnings.jsx";
-import { renderPage, text } from "./helpers.jsx";
+import { renderPage, text, mockApi } from "./helpers.jsx";
 
 // Every expected value below is READ FROM THE FIXTURES (real API responses of the rebuilt pipeline); none is typed in.
 const S = fx["/api/summary"], P = fx["/api/pipeline-stats"], LT = fx["/api/lead-time"], CTX = fx["/api/evaluation-context"], RID = fx.__rid__;
@@ -526,5 +526,146 @@ describe("Alert shown on every candidate page", () => {
       const r = await renderPage(Page, { override: NO_WARN, until });
       expect(r.container.querySelector('[data-testid="alert-badge"]')).toBeNull(); expect(r.container.querySelectorAll("[data-alerted-chip]").length).toBe(0);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------- the Evaluation page (all evaluation charts)
+import Evaluation from "../src/pages/Evaluation.jsx";
+import * as E from "../src/utils/evaluationCharts.js";
+import fs from "node:fs";
+
+describe("Evaluation page: the numbers behind every chart", () => {
+  const EV = fx["/api/evaluation"];
+  const byName = Object.fromEntries(EV.models.map((m) => [m.name, m]));
+
+  it("the confusion matrices are the stored counts, add up to the test set, and give the reported metrics", () => {
+    for (const m of EV.models) {
+      const c = E.confusionCells(m.confusion_matrix);
+      expect(c.total).toBe(m.n_samples); expect(c.positives).toBe(m.n_positive);
+      expect(c.cells.map((x) => x.count)).toEqual([m.confusion_matrix.tp, m.confusion_matrix.fn, m.confusion_matrix.fp, m.confusion_matrix.tn]);
+      expect(c.precision ?? 0).toBeCloseTo(m.metrics.precision, 12); expect(c.recall).toBeCloseTo(m.metrics.recall, 12); expect(c.falsePositiveRate).toBeCloseTo(m.metrics.false_warning_rate, 12);
+    }
+  });
+  it("the alert confusion matrix adds up to the candidates and agrees with the alert and ring counts", () => {
+    const a = EV.alert_confusion, c = E.confusionCells(a.confusion_matrix);
+    expect(c.total).toBe(a.n_candidates); expect(a.confusion_matrix.tp + a.confusion_matrix.fp).toBe(a.n_alerts); expect(a.confusion_matrix.tp + a.confusion_matrix.fn).toBe(a.n_ring_candidates);
+    expect(a.confusion_matrix.tp).toBe(EV.counts.alerts_with_ring_tx); expect(a.n_alerts).toBe(EV.counts.alerts);
+  });
+  it("each ROC curve runs from (0,0) to (1,1), only rises, encloses the reported AUC, and passes the model's operating point", () => {
+    for (const r of E.rocSeries(EV.models)) {
+      const p = r.points; expect(p[0]).toEqual({ x: 0, y: 0 }); expect(p.at(-1)).toEqual({ x: 1, y: 1 });
+      for (let i = 1; i < p.length; i++) { expect(p[i].x).toBeGreaterThanOrEqual(p[i - 1].x); expect(p[i].y).toBeGreaterThanOrEqual(p[i - 1].y); }
+      let area = 0; for (let i = 1; i < p.length; i++) area += ((p[i].y + p[i - 1].y) / 2) * (p[i].x - p[i - 1].x);
+      expect(Math.abs(area - byName[r.name].metrics.roc_auc)).toBeLessThan(0.01); expect(r.auc).toBeCloseTo(byName[r.name].metrics.roc_auc, 12);
+      expect(r.op.recall).toBeCloseTo(byName[r.name].metrics.recall, 12);
+    }
+  });
+  it("the precision-recall step curve has the reported average precision as its area, to the precision it is stored at (a straight-line join would not)", () => {
+    for (const r of E.prSeries(EV.models)) {
+      expect(E.stepArea(r.points)).toBeCloseTo(byName[r.name].metrics.pr_auc, 6);                 // points are stored to 6 decimals
+      const joined = r.points.filter((_, i) => i % 2 === 1);                     // the corner points only: what a straight-line join would draw
+      if (joined.length > 3 && r.name.includes("random_forest")) expect(Math.abs(E.stepArea(joined) - r.ap)).toBeGreaterThan(1e-4);
+      expect(r.prevalence).toBeCloseTo(byName[r.name].n_positive / byName[r.name].n_samples, 12);
+    }
+  });
+  it("the low false-positive zoom stops exactly at its limit", () => {
+    for (const r of E.rocSeries(EV.models)) { const z = E.zoomRoc(r.points, 0.02); expect(z.at(-1).x).toBeCloseTo(0.02, 12); expect(Math.max(...z.map((q) => q.x))).toBeLessThanOrEqual(0.02 + 1e-12); }
+  });
+  it("Wilson intervals match an independent implementation (SciPy proportion_ci, method wilson)", () => {
+    const want = { "5/30": [0.073365, 0.335644], "29/30": [0.833296, 0.994091], "0/30": [0, 0.113513], "17/30": [0.391973, 0.726225], "9/11": [0.523019, 0.948632] };
+    for (const [key, [lo, hi]] of Object.entries(want)) { const [k, n] = key.split("/").map(Number); const w = E.wilson(k, n); expect(w.lo).toBeCloseTo(lo, 5); expect(w.hi).toBeCloseTo(hi, 5); }
+    expect(E.wilson(1, 0)).toBeNull();
+  });
+  it("warning outcomes and lead-time bands each account for every evaluable ring, and tie to the Warning Timeline", () => {
+    const n = EV.counts.n_evaluable;
+    for (const o of E.outcomeRows(EV.outcomes)) expect(o.before + o.at + o.after + o.none).toBe(n);
+    const h = E.leadHistogram(EV.rings); expect(h.reduce((s, r) => s + r.queue, 0)).toBe(n); expect(h.reduce((s, r) => s + r.alerts, 0)).toBe(n);
+    expect(h.find((r) => r.bin === "No warning").alerts).toBe(EV.outcomes.alert.not_seen); expect(h.find((r) => r.bin === "At completion (0)").queue).toBe(EV.outcomes.queue.at);
+    expect(E.leadRows(EV.rings)).toHaveLength(n);
+  });
+  it("the threshold chart is the stored frontier, with the configured threshold marked and no extra points", () => {
+    const t = E.thresholdRows(EV.frontier); expect(t).toHaveLength(EV.frontier.length);
+    expect(t.find((r) => r.configured).threshold).toBe(EV.alert_threshold);
+    expect(t.find((r) => r.configured).alerts).toBe(EV.counts.alerts);
+  });
+  it("stability whiskers are never zero length, and the intervals use the real counts", () => {
+    for (const r of E.stabilityRows(EV.stability, ["alerts", "seen", "early", "high"], {})) { expect(r.err[0]).toBeGreaterThan(0); expect(r.err[1]).toBeGreaterThan(0); expect(r.min).toBeLessThanOrEqual(r.median); expect(r.median).toBeLessThanOrEqual(r.max); }
+    const iv = E.intervalRows(EV.counts); expect(iv).toHaveLength(5);
+    expect(iv[0].k).toBe(EV.counts.queue_seen); expect(iv[3].k).toBe(EV.counts.alerts_early); expect(iv[4].n).toBe(EV.counts.alerts);
+    for (const r of iv) { expect(r.lo).toBeLessThanOrEqual(r.p); expect(r.p).toBeLessThanOrEqual(r.hi); }
+  });
+  it("sources exclude the retired v1 baseline, controls cover four policies at four budgets, and horizons pair both feature sets", () => {
+    expect(E.sourceRows(EV.sources).map((s) => s.source).join("|")).not.toMatch(/v1/i); expect(E.sourceRows(EV.sources)).toHaveLength(4);
+    const c = E.controlSeries(EV.controls, "detection_rate"); expect(c.models).toHaveLength(4); expect(c.rows).toHaveLength(4);
+    const hr = E.horizonRows(EV.horizon, "pr_auc"); expect(hr.length).toBeGreaterThanOrEqual(3); for (const r of hr) { expect(r["No account history"]).not.toBeNull(); expect(r["With account history"]).not.toBeNull(); }
+    const rk = E.rankingRows(EV.ranking); expect(rk.base).toBeCloseTo(EV.ranking.n_containing_ring_tx / EV.ranking.n_candidates, 12);
+  });
+  it("missing blocks give null, never invented numbers", () => {
+    expect(E.rocSeries(null)).toBeNull(); expect(E.rocSeries([{ curves: null }])).toBeNull(); expect(E.confusionCells({ tp: 1 })).toBeNull(); expect(E.thresholdRows(null)).toBeNull();
+    expect(E.outcomeRows({})).toBeNull(); expect(E.intervalRows(null)).toBeNull(); expect(E.leadHistogram([])).toBeNull(); expect(E.rankingRows({})).toBeNull();
+  });
+});
+
+describe("Evaluation page: what the page shows", () => {
+  const EV = fx["/api/evaluation"];
+  const render1 = async (override = {}) => { window.__EVAL_CHART_WIDTH__ = 500; return renderPage(Evaluation, { override: { "/api/evaluation": override.ev || EV }, until: "Important interpretation" }); };
+  afterEach(() => { delete window.__EVAL_CHART_WIDTH__; });
+
+  it("shows every chart and all five confusion matrices on one page, each chart actually drawn", async () => {
+    const errors = []; const spy = vi.spyOn(console, "error").mockImplementation((...a) => errors.push(a.join(" ")));
+    const r = await render1();
+    const ids = [...r.container.querySelectorAll('[data-testid^="chart-"]')].map((e) => e.getAttribute("data-testid"));
+    expect(ids).toHaveLength(19);
+    for (const e of r.container.querySelectorAll('[data-testid^="chart-"]')) expect(e.querySelector("svg"), e.getAttribute("data-testid")).not.toBeNull();
+    expect(r.container.querySelectorAll('[data-testid^="cm-"][data-testid]:not([data-testid^="cm-reading"])')).toHaveLength(5);
+    expect(text(r)).not.toContain("Not yet evaluated");
+    spy.mockRestore(); expect(errors.filter((e) => /same key|NaN|Invalid prop|Failed prop/i.test(e))).toEqual([]);   // no duplicate keys, NaN geometry or bad props
+  });
+  it("each confusion matrix cell on screen holds the stored count", async () => {
+    const r = await render1();
+    for (const m of EV.models) {
+      const box = r.container.querySelector(`[data-testid="cm-${m.name}"]`);
+      for (const k of ["tp", "fp", "fn", "tn"]) expect(Number(box.querySelector(`[data-cell="${k}"]`).getAttribute("data-count"))).toBe(m.confusion_matrix[k]);
+    }
+    const a = r.container.querySelector('[data-testid="cm-alerts"]');
+    for (const k of ["tp", "fp", "fn", "tn"]) expect(Number(a.querySelector(`[data-cell="${k}"]`).getAttribute("data-count"))).toBe(EV.alert_confusion.confusion_matrix[k]);
+  });
+  it("the reading under each chart is computed from the data (change the data and the sentence changes)", async () => {
+    const r = await render1();
+    const p = EV.models.find((m) => m.proposed);
+    expect(text(r.container.querySelector('[data-testid="reading-roc"]') ? r : r)).toContain(E.fmt(p.curves.roc_auc, 4));
+    const alt = JSON.parse(JSON.stringify(EV)); alt.models.find((m) => m.proposed).curves.roc_auc = 0.5;
+    const r2 = await render1({ ev: alt }); expect(r2.container.querySelector('[data-testid="reading-roc"]').textContent).toContain("Proposed 0.5000");
+  });
+  it("without the curve file the ROC and PR charts say 'Not yet evaluated' with the command, and everything else still draws", async () => {
+    const alt = JSON.parse(JSON.stringify(EV)); alt.curves_status = "missing"; alt.models.forEach((m) => { m.curves = null; m.curves_status = "missing"; });
+    const r = await render1({ ev: alt });
+    for (const id of ["roc", "roc-zoom", "pr"]) { const c = r.container.querySelector(`[data-testid="chart-${id}"]`); expect(c.textContent).toContain("Not yet evaluated"); expect(c.textContent).toContain("python scripts/rebuild_v2.py models"); expect(c.querySelector("svg")).toBeNull(); }
+    expect(r.container.querySelector('[data-testid="chart-metrics"] svg')).not.toBeNull(); expect(r.container.querySelectorAll('[data-cell]').length).toBe(20);   // matrices need no curves
+  });
+  it("curves from a different run than the metrics are refused with an explanation", async () => {
+    const alt = JSON.parse(JSON.stringify(EV)); alt.curves_status = "mismatch"; alt.models.forEach((m) => { m.curves = null; m.curves_status = "mismatch"; });
+    const r = await render1({ ev: alt }); expect(r.container.querySelector('[data-testid="chart-roc"]').textContent).toContain("different run");
+  });
+  it("a block that was never computed shows 'Not yet evaluated' on its own chart only", async () => {
+    const alt = JSON.parse(JSON.stringify(EV)); alt.stability = null; alt.horizon = null;
+    const r = await render1({ ev: alt });
+    for (const id of ["stability-counts", "stability-ratios", "horizon-pr", "horizon-precision"]) expect(r.container.querySelector(`[data-testid="chart-${id}"]`).textContent).toContain("Not yet evaluated");
+    expect(r.container.querySelector('[data-testid="chart-threshold"] svg')).not.toBeNull();
+  });
+  it("an API error is shown as an error, not as an empty page of charts", async () => {
+    const r = await renderPage(Evaluation, { override: { "/api/evaluation": "error" } });
+    expect(r.container.querySelector('[data-testid^="chart-"]')).toBeNull(); expect(r.container.querySelector('[data-cell]')).toBeNull();
+    expect(text(r)).not.toContain("Important interpretation");
+  });
+  it("carries the responsible-use statement, and is reachable from the sidebar and the router", () => {
+    const main = fs.readFileSync("src/main.jsx", "utf8");
+    expect(main).toMatch(/\["\/evaluation", "Evaluation"\]/); expect(main).toMatch(/<Route path="\/evaluation" element=\{<Evaluation \/>\} \/>/);
+    expect(fs.readFileSync("src/api.js", "utf8")).toMatch(/evaluation: \(\) => get\("\/evaluation"\)/);
+  });
+  it("the page states the responsible-use line and uses the same model colours in every chart legend", async () => {
+    const r = await render1(); expect(text(r)).toContain("not criminal guilt");
+    const legends = [...r.container.querySelectorAll('[data-testid="chart-metrics"] [data-testid="legend"] span span')].map((s) => s.style.background || s.style.backgroundColor);
+    expect(legends.length).toBe(4); expect(new Set(legends).size).toBe(4);
   });
 });

@@ -14,6 +14,7 @@ import RingEarlyWarning from "./pages/RingEarlyWarning.jsx";
 import WarningTimeline from "./pages/WarningTimeline.jsx";
 import AlertLog from "./pages/AlertLog.jsx";
 import PatternEvidence from "./pages/PatternEvidence.jsx";
+import Evaluation from "./pages/Evaluation.jsx";
 import { api } from "./api.js";
 import { useApi } from "./components/ui.jsx";
 import DataExplorer from "./pages/DataExplorer.jsx";
@@ -31,6 +32,7 @@ const nav = [
   ["/pattern-evidence", "Pattern Evidence"],
   ["/models", "Model Performance"],
   ["/early-warning", "Ablations & Controls"],
+  ["/evaluation", "Evaluation"],
   ["/explorer", "Data Explorer"],
 ];
 
@@ -73,6 +75,7 @@ function Shell() {
           <Route path="/pattern-evidence" element={<PatternEvidence />} />
           <Route path="/models" element={<ModelPerformance />} />
           <Route path="/early-warning" element={<RingEarlyWarning />} />
+          <Route path="/evaluation" element={<Evaluation />} />
           <Route path="/explorer" element={<DataExplorer />} />
         </Routes>
       </main>
